@@ -4,6 +4,9 @@ import hashlib
 import json
 import os
 
+from orda2 import orda2_exceptions
+from orda2.orda2_exceptions import body_sha256
+
 ZERO_HASH = "0" * 64
 
 
@@ -63,7 +66,19 @@ def append_event(path, event_dict_without_hash):
 
 
 def verify_chain(events):
+    """Check chain links and hashes.
+
+    Returns ``(problems, exceptions)``. ``exceptions`` holds one named
+    line per event whose recorded hash matches a declared
+    ``NONCONFORMING_SEGMENTS`` pin with intact links and body bytes;
+    exceptions are NOT problems (``ok`` stays true). A declared pin
+    whose body bytes were rewritten yields a hard ``pinned body
+    mismatch`` problem. The pre-existing monotonic seq-vs-position
+    check is unchanged, so a trailing line masquerading as an excepted
+    seq still fails.
+    """
     problems = []
+    exceptions = []
     prev = ZERO_HASH
     expected_seq = 1
     required_fields = ["seq", "prev_hash", "hash", "revision", "ts", "writer", "kind"]
@@ -84,13 +99,23 @@ def verify_chain(events):
             problems.append("seq %s line %d: hash computation failed (%s) — integrity failure" % (seq, idx, ex))
             exp = None
         if exp is not None and e.get("hash") != exp:
-            problems.append("seq %s line %d: hash mismatch (event tampered or corrupt) — integrity failure" % (seq, idx))
+            entry = orda2_exceptions.NONCONFORMING_SEGMENTS.get(seq) if isinstance(seq, int) else None
+            pin_hash = entry.get("hash") if entry else None
+            pin_body = entry.get("body_sha256") if entry else None
+            hash_pinned = pin_hash is not None and e.get("hash") == pin_hash
+            linked = e.get("prev_hash") == prev and seq == idx
+            if hash_pinned and linked and body_sha256(e) == pin_body:
+                exceptions.append("seq %s: declared non-conforming segment" % (seq,))
+            elif hash_pinned and e.get("prev_hash") == prev:
+                problems.append("seq %s: pinned body mismatch — integrity failure" % (seq,))
+            else:
+                problems.append("seq %s line %d: hash mismatch (event tampered or corrupt) — integrity failure" % (seq, idx))
         # advance chain: use recorded hash (even if tampered) for next prev check so subsequent prev_hash mismatches are also reported
         h = e.get("hash")
         if h:
             prev = h
         expected_seq += 1
-    return problems
+    return problems, exceptions
 
 
 def verify_store(home, events_path=None, state_path=None):
@@ -101,20 +126,20 @@ def verify_store(home, events_path=None, state_path=None):
     try:
         events = read_events(events_path)
     except ValueError as e:
-        return {"ok": False, "problems": [str(e)], "events": 0}
+        return {"ok": False, "problems": [str(e)], "exceptions": [], "events": 0}
     except Exception as e:
-        return {"ok": False, "problems": ["events read failed: %s" % e], "events": 0}
-    problems.extend(verify_chain(events))
+        return {"ok": False, "problems": ["events read failed: %s" % e], "exceptions": [], "events": 0}
+    problems, exceptions = verify_chain(events)
     if os.path.exists(state_path):
         try:
             with open(state_path) as f:
                 state = json.load(f)
         except json.JSONDecodeError as e:
             problems.append("state.json corrupt: unparseable JSON (%s) — integrity failure" % e.msg)
-            return {"ok": False, "problems": problems, "events": len(events)}
+            return {"ok": False, "problems": problems, "exceptions": exceptions, "events": len(events)}
         except Exception as e:
             problems.append("state.json read failed: %s — integrity failure" % e)
-            return {"ok": False, "problems": problems, "events": len(events)}
+            return {"ok": False, "problems": problems, "exceptions": exceptions, "events": len(events)}
         last_rev = events[-1]["revision"] if events else 0
         # v2: state revision tracks event count / last revision
         if state.get("revision", 0) < last_rev:
@@ -130,7 +155,7 @@ def verify_store(home, events_path=None, state_path=None):
                     problems.append("projection brief.json at revision %s, state at %s (stale projection; run: reconcile)" % (brief.get("revision"), state.get("revision")))
             except Exception:
                 pass
-    return {"ok": not problems, "problems": problems, "events": len(events)}
+    return {"ok": not problems, "problems": problems, "exceptions": exceptions, "events": len(events)}
 
 
 def rechain_segment(segment_events, new_prev_hash, start_seq):

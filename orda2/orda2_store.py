@@ -431,15 +431,17 @@ class Store:
     # ---- verify / reconcile ----
     def verify(self):
         problems = []
+        exceptions = []
         # Read events with corruption handling
         try:
             events = read_events(self.events_path)
         except ValueError as e:
             # Corrupt events.jsonl -> integrity failure (exit 5)
-            return {"ok": False, "problems": [str(e)], "events": 0}
+            return {"ok": False, "problems": [str(e)], "exceptions": [], "events": 0}
         except Exception as e:
-            return {"ok": False, "problems": ["events read failed: %s — integrity failure" % e], "events": 0}
-        problems.extend(verify_chain(events))
+            return {"ok": False, "problems": ["events read failed: %s — integrity failure" % e], "exceptions": [], "events": 0}
+        chain_problems, exceptions = verify_chain(events)
+        problems.extend(chain_problems)
         # Check state.json parses
         if os.path.exists(self.state_path):
             try:
@@ -447,10 +449,10 @@ class Store:
                     state = json.load(f)
             except json.JSONDecodeError as e:
                 problems.append("state.json corrupt: unparseable JSON (%s) — integrity failure" % e.msg)
-                return {"ok": False, "problems": problems, "events": len(events)}
+                return {"ok": False, "problems": problems, "exceptions": exceptions, "events": len(events)}
             except Exception as e:
                 problems.append("state.json read failed: %s — integrity failure" % e)
-                return {"ok": False, "problems": problems, "events": len(events)}
+                return {"ok": False, "problems": problems, "exceptions": exceptions, "events": len(events)}
             last_rev = events[-1]["revision"] if events else 0
             if state.get("revision", 0) < last_rev:
                 problems.append("state revision %s behind event log revision %s (crash window; run reconcile)" % (state.get("revision"), last_rev))
@@ -492,7 +494,7 @@ class Store:
         boundary = check_store_boundary(self.home)
         if boundary:
             problems.append(boundary)
-        return {"ok": not problems, "problems": problems, "events": len(events)}
+        return {"ok": not problems, "problems": problems, "exceptions": exceptions, "events": len(events)}
 
     def reconcile(self, session="reconcile"):
         """Rebuild state.json + projection from events.jsonl + records on main."""
